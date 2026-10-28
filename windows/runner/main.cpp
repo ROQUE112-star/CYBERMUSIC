@@ -7,6 +7,19 @@
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
+  // Asegurar que solo exista una instancia en ejecucion de CYBERMUSIC
+  HANDLE hMutex = ::CreateMutexW(nullptr, TRUE, L"CYBERMUSIC_SINGLE_INSTANCE_MUTEX");
+  if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+    HWND existingHwnd = ::FindWindowW(nullptr, L"CYBERMUSIC");
+    if (existingHwnd) {
+      if (::IsIconic(existingHwnd)) {
+        ::ShowWindow(existingHwnd, SW_RESTORE);
+      }
+      ::SetForegroundWindow(existingHwnd);
+    }
+    return EXIT_SUCCESS;
+  }
+
   // Attach to console when present (e.g., 'flutter run') or create a
   // new console when running with a debugger.
   if (!::AttachConsole(ATTACH_PARENT_PROCESS) && ::IsDebuggerPresent()) {
@@ -36,6 +49,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   while (::GetMessage(&msg, nullptr, 0, 0)) {
     ::TranslateMessage(&msg);
     ::DispatchMessage(&msg);
+  }
+
+  if (hMutex) {
+    ::ReleaseMutex(hMutex);
+    ::CloseHandle(hMutex);
   }
 
   ::CoUninitialize();

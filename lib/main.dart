@@ -2,8 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:ui' as ui;
-import 'dart:ui' show ImageFilter;
+import 'dart:ui' show ImageFilter, PointerDeviceKind;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
@@ -26,7 +27,7 @@ void main() async {
     center: true,
     backgroundColor: Colors.transparent,
     skipTaskbar: false,
-    titleBarStyle: TitleBarStyle.normal,
+    titleBarStyle: TitleBarStyle.hidden,
     title: 'CYBERMUSIC',
   );
 
@@ -474,9 +475,18 @@ class LibreSYProvider extends ChangeNotifier {
   final List<Track> _popularTracks = [];
   final List<Track> _recommendedTracks = [];
   final Set<String> _downloadingTrackIds = {};
+  final Set<String> _backgroundCachingTrackIds = {};
   final Map<String, String> _cachedFullAudioPaths = {};
   final List<String> _savedCustomFolders = [];
   List<Track> _activeQueue = [];
+
+  // Perfil del Artista & Discografía
+  String? _currentArtistName;
+  String? _currentArtistAvatar;
+  final List<Track> _artistTopTracks = [];
+  bool _isLoadingArtist = false;
+  Set<String> _followedArtists = {};
+  int _artistMonthlyListeners = 0;
 
   bool _isSearching = false;
   bool _isLoadingPopular = false;
@@ -521,6 +531,7 @@ class LibreSYProvider extends ChangeNotifier {
   // --- MODO BURBUJA FLOTANTE (MINI PLAYER ALWAYS-ON-TOP) ---
   bool _isMiniBubbleMode = false;
   bool _minimizeToBubbleEnabled = true;
+  bool _wasMaximizedBeforeBubble = false;
   Size? _normalWindowSize;
   Offset? _normalWindowPosition;
 
@@ -546,6 +557,21 @@ class LibreSYProvider extends ChangeNotifier {
   Color get lyricsSecondaryColor => _lyricsSecondaryColor;
   List<LyricLine> get currentLyrics => _currentLyrics;
   bool get isLoadingLyrics => _isLoadingLyrics;
+
+  // Getters Perfil del Artista
+  String? get currentArtistName => _currentArtistName;
+  String? get currentArtistAvatar => _currentArtistAvatar;
+  List<Track> get artistTopTracks => _artistTopTracks;
+  bool get isLoadingArtist => _isLoadingArtist;
+  int get artistMonthlyListeners => _artistMonthlyListeners;
+  bool isFollowingArtist(String? artist) =>
+      artist != null && _followedArtists.contains(artist.trim().toLowerCase());
+
+  String get artistMonthlyListenersFormatted {
+    final str = _artistMonthlyListeners.toString();
+    final reg = RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))');
+    return str.replaceAllMapped(reg, (m) => '${m[1]},');
+  }
 
   // Getters Spicetify Studio
   bool get isRightSidebarOpen => _isRightSidebarOpen;
@@ -602,7 +628,7 @@ class LibreSYProvider extends ChangeNotifier {
 
   void setTab(int index) {
     if (_currentTab != index) {
-      if (index == 4) {
+      if (index == 4 || index == 6) {
         _previousTab = _currentTab;
       } else {
         _previousTab = index;
@@ -625,6 +651,113 @@ class LibreSYProvider extends ChangeNotifier {
   void goBackFromLyrics() {
     _currentTab = _previousTab;
     notifyListeners();
+  }
+
+  // --- PERFIL DE ARTISTA & DISCOGRAFÍA ---
+  void openArtistProfile(String artistName, {String? avatarUrl}) {
+    final clean = artistName.trim();
+    if (clean.isEmpty || clean == 'Archivo de tu PC' || clean == 'Artista desconocido') return;
+    if (_currentTab != 6) {
+      _previousTab = _currentTab;
+    }
+    _currentTab = 6;
+    _currentArtistName = clean;
+    _currentArtistAvatar = avatarUrl;
+    final hash = clean.toLowerCase().hashCode.abs();
+    _artistMonthlyListeners = (hash % 14500000) + 650000;
+    notifyListeners();
+    fetchArtistDiscography(clean, preferredArtwork: avatarUrl);
+  }
+
+  void goBackFromArtistProfile() {
+    _currentTab = _previousTab == 6 ? 0 : _previousTab;
+    notifyListeners();
+  }
+
+  void toggleFollowArtist(String artistName) {
+    final key = artistName.trim().toLowerCase();
+    if (key.isEmpty) return;
+    if (_followedArtists.contains(key)) {
+      _followedArtists.remove(key);
+    } else {
+      _followedArtists.add(key);
+    }
+    _savePersistentState();
+    notifyListeners();
+  }
+
+  Future<void> fetchArtistDiscography(String artistName, {String? preferredArtwork}) async {
+    _isLoadingArtist = true;
+    _artistTopTracks.clear();
+    notifyListeners();
+
+    try {
+      final clean = artistName.split('&').first.split(',').first.split('feat').first.trim();
+      final url = Uri.parse(
+        'https://itunes.apple.com/search?term=${Uri.encodeComponent(clean)}&media=music&entity=song&attribute=artistTerm&limit=50',
+      );
+      final res = await http.get(url).timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body);
+        final List results = data['results'] ?? [];
+        final Set<String> seen = {};
+        for (var item in results) {
+          final t = Track.fromCatalogJson(item);
+          final norm = t.title.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+          if (!seen.contains(norm)) {
+            seen.add(norm);
+            _artistTopTracks.add(t);
+          }
+        }
+      }
+
+      // Si no hubo resultados con attribute=artistTerm, intentar búsqueda estándar
+      if (_artistTopTracks.isEmpty) {
+        final broadUrl = Uri.parse(
+          'https://itunes.apple.com/search?term=${Uri.encodeComponent(clean)}&media=music&entity=song&limit=40',
+        );
+        final broadRes = await http.get(broadUrl).timeout(const Duration(seconds: 8));
+        if (broadRes.statusCode == 200) {
+          final data = json.decode(broadRes.body);
+          final List results = data['results'] ?? [];
+          final Set<String> seen = {};
+          for (var item in results) {
+            final t = Track.fromCatalogJson(item);
+            final norm = t.title.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+            if (!seen.contains(norm)) {
+              seen.add(norm);
+              _artistTopTracks.add(t);
+            }
+          }
+        }
+      }
+
+      // Fallback a YouTube si iTunes no devolvió canciones
+      if (_artistTopTracks.isEmpty) {
+        final ytResults = await _yt.search.search('$clean canciones');
+        for (final video in ytResults.take(20)) {
+          _artistTopTracks.add(Track.fromYoutubeVideo(video));
+        }
+      }
+
+      if ((_currentArtistAvatar == null || _currentArtistAvatar!.isEmpty) && _artistTopTracks.isNotEmpty) {
+        _currentArtistAvatar = _artistTopTracks.first.artworkUrl;
+      }
+    } catch (e) {
+      debugPrint("Error obteniendo canciones de $artistName: $e");
+    } finally {
+      _isLoadingArtist = false;
+      notifyListeners();
+    }
+  }
+
+  void playArtistAll({bool shuffle = false}) {
+    if (_artistTopTracks.isEmpty) return;
+    _activeQueue = List<Track>.from(_artistTopTracks);
+    if (shuffle) {
+      _activeQueue.shuffle();
+    }
+    playTrack(_activeQueue.first);
   }
 
   // --- GESTIÓN DEL PERFIL DE USUARIO ---
@@ -812,10 +945,30 @@ class LibreSYProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  bool _isTransitioningBubbleMode = false;
+
   Future<void> enterMiniBubbleMode() async {
+    if (_isTransitioningBubbleMode || _isMiniBubbleMode) return;
+    _isTransitioningBubbleMode = true;
     try {
-      _normalWindowSize = await windowManager.getSize();
-      _normalWindowPosition = await windowManager.getPosition();
+      final isMax = await windowManager.isMaximized();
+      _wasMaximizedBeforeBubble = isMax;
+
+      if (!isMax) {
+        final curSize = await windowManager.getSize();
+        final curPos = await windowManager.getPosition();
+        // Guardar tamaño normal válido (mínimo 900x600 para evitar capturar tamaños corruptos o residuales)
+        if (curSize.width >= 900 && curSize.height >= 600) {
+          _normalWindowSize = curSize;
+          _normalWindowPosition = curPos;
+        } else if (_normalWindowSize == null || _normalWindowSize!.width < 900) {
+          _normalWindowSize = const Size(1280, 800);
+        }
+      } else {
+        await windowManager.unmaximize();
+        await Future.delayed(const Duration(milliseconds: 60));
+      }
+
       _isMiniBubbleMode = true;
       notifyListeners();
 
@@ -824,27 +977,47 @@ class LibreSYProvider extends ChangeNotifier {
       await windowManager.setHasShadow(false);
       await Window.setEffect(effect: WindowEffect.transparent);
       await windowManager.setSize(const Size(260, 260));
-      await windowManager.setResizable(false);
+      await windowManager.focus();
     } catch (e) {
       debugPrint('Error entrando en modo burbuja flotante: $e');
+    } finally {
+      _isTransitioningBubbleMode = false;
     }
   }
 
   Future<void> exitMiniBubbleMode() async {
+    if (_isTransitioningBubbleMode || !_isMiniBubbleMode) return;
+    _isTransitioningBubbleMode = true;
     try {
+      await windowManager.setAlwaysOnTop(false);
+      await windowManager.setTitleBarStyle(TitleBarStyle.hidden);
+      await windowManager.setHasShadow(true);
+
+      if (_wasMaximizedBeforeBubble) {
+        await windowManager.maximize();
+      } else {
+        final targetSize = (_normalWindowSize != null &&
+                _normalWindowSize!.width >= 900 &&
+                _normalWindowSize!.height >= 600)
+            ? _normalWindowSize!
+            : const Size(1280, 800);
+        await windowManager.setSize(targetSize);
+        if (_normalWindowPosition != null) {
+          await windowManager.setPosition(_normalWindowPosition!);
+        } else {
+          await windowManager.center();
+        }
+      }
+
       _isMiniBubbleMode = false;
       notifyListeners();
-
-      await windowManager.setAlwaysOnTop(false);
-      await windowManager.setTitleBarStyle(TitleBarStyle.normal);
-      await windowManager.setHasShadow(true);
-      await windowManager.setSize(_normalWindowSize ?? const Size(1280, 800));
-      if (_normalWindowPosition != null) {
-        await windowManager.setPosition(_normalWindowPosition!);
-      }
-      await windowManager.setResizable(true);
+      await windowManager.focus();
     } catch (e) {
       debugPrint('Error saliendo del modo burbuja flotante: $e');
+      _isMiniBubbleMode = false;
+      notifyListeners();
+    } finally {
+      _isTransitioningBubbleMode = false;
     }
   }
 
@@ -942,6 +1115,7 @@ class LibreSYProvider extends ChangeNotifier {
         'adaptiveColorFromBackground': _adaptiveColorFromBackground,
         'customVideoPath': _customVideoPath,
         'minimizeToBubbleEnabled': _minimizeToBubbleEnabled,
+        'followedArtists': _followedArtists.toList(),
       };
       await file.writeAsString(json.encode(payload));
     } catch (e) {
@@ -1077,6 +1251,10 @@ class LibreSYProvider extends ChangeNotifier {
             }
           }
         }
+
+        if (data['followedArtists'] is List) {
+          _followedArtists = (data['followedArtists'] as List).map((e) => e.toString().toLowerCase()).toSet();
+        }
         notifyListeners();
       }
     } catch (e) {
@@ -1133,6 +1311,7 @@ class LibreSYProvider extends ChangeNotifier {
 
   List<Track> _getEffectiveQueue() {
     if (_activeQueue.isNotEmpty) return _activeQueue;
+    if (_currentTab == 6 && _artistTopTracks.isNotEmpty) return _artistTopTracks;
     if (_currentTab == 1 && _onlineSearchResults.isNotEmpty) return _onlineSearchResults;
     if (_currentTab == 3 && _favoriteTracks.isNotEmpty) return _favoriteTracks;
     if (allLibraryTracks.isNotEmpty) return allLibraryTracks;
@@ -1140,7 +1319,9 @@ class LibreSYProvider extends ChangeNotifier {
   }
 
   void _updateActiveQueueFromContext() {
-    if (_currentTab == 1 && _onlineSearchResults.isNotEmpty) {
+    if (_currentTab == 6 && _artistTopTracks.isNotEmpty) {
+      _activeQueue = List<Track>.from(_artistTopTracks);
+    } else if (_currentTab == 1 && _onlineSearchResults.isNotEmpty) {
       _activeQueue = List<Track>.from(_onlineSearchResults);
     } else if (_currentTab == 3 && _favoriteTracks.isNotEmpty) {
       _activeQueue = List<Track>.from(_favoriteTracks);
@@ -1251,6 +1432,174 @@ class LibreSYProvider extends ChangeNotifier {
     return cacheDir;
   }
 
+  String _cleanSongSearchQuery(String artist, String title) {
+    String cleanTitle = title
+        .replaceAll(RegExp(r'\((feat\.|ft\.|official|video|audio|remastered|deluxe|version).*?\)', caseSensitive: false), '')
+        .replaceAll(RegExp(r'\[(feat\.|ft\.|official|video|audio|remastered|deluxe|version).*?\]', caseSensitive: false), '')
+        .trim();
+    String cleanArtist = artist
+        .replaceAll('Archivos locales', '')
+        .replaceAll('Artista desconocido', '')
+        .trim();
+    if (cleanArtist.isNotEmpty) {
+      return '$cleanArtist - $cleanTitle';
+    }
+    return cleanTitle;
+  }
+
+  Future<String?> _resolveYoutubeVideoId(Track track) async {
+    if (track.youtubeVideoId != null && track.youtubeVideoId!.isNotEmpty) {
+      return track.youtubeVideoId;
+    }
+    try {
+      final queryBase = _cleanSongSearchQuery(track.artist, track.title);
+      final searchQueries = [
+        '$queryBase official audio',
+        '$queryBase audio',
+        queryBase,
+        '${track.artist} - ${track.title}',
+      ];
+
+      for (final query in searchQueries) {
+        try {
+          final results = await _yt.search.search(query).timeout(const Duration(seconds: 6));
+          if (results.isNotEmpty) {
+            return results.first.id.value;
+          }
+        } catch (_) {}
+      }
+    } catch (e) {
+      debugPrint('Error buscando video en YouTube: $e');
+    }
+    return null;
+  }
+
+  void _cacheStreamInBackground(
+    Track track,
+    yt_lib.AudioOnlyStreamInfo audioStream,
+    File destinationFile,
+  ) {
+    if (destinationFile.existsSync() && destinationFile.lengthSync() > 100000) {
+      return;
+    }
+    if (_backgroundCachingTrackIds.contains(track.id)) return;
+    _backgroundCachingTrackIds.add(track.id);
+
+    Future.microtask(() async {
+      final tempFile = File('${destinationFile.path}.tmp');
+      try {
+        if (tempFile.existsSync()) {
+          try {
+            tempFile.deleteSync();
+          } catch (_) {}
+        }
+        final stream = _yt.videos.streamsClient.get(audioStream);
+        final sink = tempFile.openWrite();
+        await stream.pipe(sink);
+        await sink.flush();
+        await sink.close();
+
+        if (tempFile.existsSync() && tempFile.lengthSync() > 100000) {
+          if (destinationFile.existsSync()) {
+            try {
+              destinationFile.deleteSync();
+            } catch (_) {}
+          }
+          tempFile.renameSync(destinationFile.path);
+          _cachedFullAudioPaths[track.id] = destinationFile.path;
+          debugPrint('Pista cacheada en segundo plano con éxito: ${destinationFile.path}');
+        }
+      } catch (e) {
+        debugPrint('Error en caché en segundo plano: $e');
+        if (tempFile.existsSync()) {
+          try {
+            tempFile.deleteSync();
+          } catch (_) {}
+        }
+      } finally {
+        _backgroundCachingTrackIds.remove(track.id);
+      }
+    });
+  }
+
+  String? _findExecutable(String name) {
+    // 1. Directorio donde está instalado CYBERMUSIC.exe (estándar para instalador y amigos)
+    try {
+      final appDir = File(Platform.resolvedExecutable).parent.path;
+      final exeInApp = File('$appDir\\$name');
+      if (exeInApp.existsSync()) return exeInApp.path;
+      final exeInData = File('$appDir\\data\\$name');
+      if (exeInData.existsSync()) return exeInData.path;
+    } catch (_) {}
+
+    // 2. Carpeta de música del usuario (C:\Users\<user>\Music\LIBRE-SY)
+    try {
+      final baseDir = _getMusicFolder();
+      final exeInMusic = File('${baseDir.path}\\$name');
+      if (exeInMusic.existsSync()) return exeInMusic.path;
+    } catch (_) {}
+
+    // 3. Directorio de trabajo actual
+    try {
+      final exeInCurrent = File('.\\$name');
+      if (exeInCurrent.existsSync()) return exeInCurrent.path;
+    } catch (_) {}
+
+    return null;
+  }
+
+  Future<String?> _resolveAndCacheFullAudioYtDlp(Track track, File cachedFile) async {
+    final ytDlpPath = _findExecutable('yt-dlp.exe');
+    final ffmpegPath = _findExecutable('ffmpeg.exe');
+    if (ytDlpPath == null) {
+      debugPrint('yt-dlp.exe no encontrado en ninguna ruta del sistema');
+      return null;
+    }
+
+    try {
+      final queryTarget = (track.youtubeVideoId != null && track.youtubeVideoId!.isNotEmpty)
+          ? 'https://www.youtube.com/watch?v=${track.youtubeVideoId}'
+          : 'ytsearch1:${track.artist} - ${track.title} Official Audio';
+
+      const nodePath = 'C:\\Program Files\\nodejs\\node.exe';
+      final hasNode = File(nodePath).existsSync();
+
+      final args = <String>[
+        if (hasNode) ...[
+          '--js-runtimes',
+          'node:$nodePath',
+        ],
+        if (ffmpegPath != null) ...[
+          '--ffmpeg-location',
+          ffmpegPath,
+        ],
+        '--concurrent-fragments',
+        '4',
+        '-f',
+        '140/bestaudio[ext=m4a]/bestaudio',
+        '-o',
+        cachedFile.path,
+        '--no-playlist',
+        '--quiet',
+        '--no-warnings',
+        queryTarget,
+      ];
+
+      final proc = await Process.run(ytDlpPath, args);
+      if (proc.exitCode != 0) {
+        debugPrint('yt-dlp proceso código de salida ${proc.exitCode}: ${proc.stderr}');
+      }
+
+      if (cachedFile.existsSync() && cachedFile.lengthSync() > 100000) {
+        _cachedFullAudioPaths[track.id] = cachedFile.path;
+        return cachedFile.path;
+      }
+    } catch (e) {
+      debugPrint("Error ejecutando yt-dlp: $e");
+    }
+    return null;
+  }
+
   Future<String?> _resolveAndCacheFullAudio(Track track) async {
     if (track.isLocal && File(track.audioUrl).existsSync()) {
       return track.audioUrl;
@@ -1263,9 +1612,6 @@ class LibreSYProvider extends ChangeNotifier {
       }
     }
 
-    final baseDir = _getMusicFolder();
-    final ytDlpPath = '${baseDir.path}\\yt-dlp.exe';
-    final ffmpegPath = '${baseDir.path}\\ffmpeg.exe';
     final cacheDir = _getCacheFolder();
     final safeId = track.id.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
     final cachedFile = File('${cacheDir.path}\\$safeId.m4a');
@@ -1281,39 +1627,96 @@ class LibreSYProvider extends ChangeNotifier {
       }
     }
 
+    // 1. Descarga completa vía yt-dlp empaquetado (garantizado, rápido ~1s y sin cortes)
+    final ytDlpResult = await _resolveAndCacheFullAudioYtDlp(track, cachedFile);
+    if (ytDlpResult != null && File(ytDlpResult).existsSync() && File(ytDlpResult).lengthSync() > 100000) {
+      _cachedFullAudioPaths[track.id] = ytDlpResult;
+      return ytDlpResult;
+    }
+
+    // 2. Fallback pure Dart con YoutubeExplode
     try {
-      if (File(ytDlpPath).existsSync()) {
-        final queryTarget = (track.youtubeVideoId != null && track.youtubeVideoId!.isNotEmpty)
-            ? 'https://www.youtube.com/watch?v=${track.youtubeVideoId}'
-            : 'ytsearch1:${track.artist} - ${track.title} Official Audio';
+      final videoId = await _resolveYoutubeVideoId(track);
+      if (videoId != null && videoId.isNotEmpty) {
+        final manifest = await _yt.videos.streamsClient.getManifest(videoId).timeout(const Duration(seconds: 8));
+        yt_lib.AudioOnlyStreamInfo? audioStream;
+        try {
+          audioStream = manifest.audioOnly.firstWhere(
+            (s) => s.container.name.toLowerCase() == 'mp4' || s.container == yt_lib.StreamContainer.mp4,
+          );
+        } catch (_) {
+          audioStream = manifest.audioOnly.withHighestBitrate();
+        }
 
-        final args = <String>[
-          '--js-runtimes',
-          'node:C:\\Program Files\\nodejs\\node.exe',
-          if (File(ffmpegPath).existsSync()) ...[
-            '--ffmpeg-location',
-            ffmpegPath,
-          ],
-          '--concurrent-fragments',
-          '4',
-          '-f',
-          '140/bestaudio[ext=m4a]/bestaudio',
-          '-o',
-          cachedFile.path,
-          '--no-playlist',
-          '--quiet',
-          queryTarget,
-        ];
+        if (audioStream != null) {
+          final tempFile = File('${cachedFile.path}.tmp');
+          if (tempFile.existsSync()) {
+            try {
+              tempFile.deleteSync();
+            } catch (_) {}
+          }
+          final stream = _yt.videos.streamsClient.get(audioStream);
+          final sink = tempFile.openWrite();
+          await stream.pipe(sink).timeout(const Duration(seconds: 15));
+          await sink.flush();
+          await sink.close();
 
-        await Process.run(ytDlpPath, args);
-
-        if (cachedFile.existsSync() && cachedFile.lengthSync() > 100000) {
-          _cachedFullAudioPaths[track.id] = cachedFile.path;
-          return cachedFile.path;
+          if (tempFile.existsSync() && tempFile.lengthSync() > 100000) {
+            if (cachedFile.existsSync()) {
+              try {
+                cachedFile.deleteSync();
+              } catch (_) {}
+            }
+            tempFile.renameSync(cachedFile.path);
+            _cachedFullAudioPaths[track.id] = cachedFile.path;
+            return cachedFile.path;
+          }
         }
       }
     } catch (e) {
-      debugPrint("Error en yt-dlp: $e");
+      debugPrint('Error resolviendo audio con YoutubeExplode: $e');
+    }
+
+    return null;
+  }
+
+  Future<Source?> _resolvePlayableSource(Track track) async {
+    // 1. Archivo local de la computadora
+    if (track.isLocal && File(track.audioUrl).existsSync()) {
+      return DeviceFileSource(track.audioUrl);
+    }
+
+    // 2. Archivo completo en caché local existente
+    final cacheDir = _getCacheFolder();
+    final safeId = track.id.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+    final cachedFile = File('${cacheDir.path}\\$safeId.m4a');
+
+    if (cachedFile.existsSync() && cachedFile.lengthSync() > 100000) {
+      _cachedFullAudioPaths[track.id] = cachedFile.path;
+      return DeviceFileSource(cachedFile.path);
+    }
+
+    if (_cachedFullAudioPaths.containsKey(track.id)) {
+      final p = _cachedFullAudioPaths[track.id]!;
+      if (File(p).existsSync() && File(p).lengthSync() > 100000) {
+        return DeviceFileSource(p);
+      }
+    }
+
+    // 3. Resolver y descargar la canción completa a la caché local con yt-dlp empaquetado
+    try {
+      final cachedPath = await _resolveAndCacheFullAudio(track);
+      if (cachedPath != null && File(cachedPath).existsSync() && File(cachedPath).lengthSync() > 100000) {
+        return DeviceFileSource(cachedPath);
+      }
+    } catch (e) {
+      debugPrint('Error resolviendo audio completo: $e');
+    }
+
+    // 4. Último recurso absoluto: Preview de 30s de iTunes (solo si no hay internet o falló todo)
+    if (track.previewFallbackUrl != null && track.previewFallbackUrl!.isNotEmpty) {
+      debugPrint('Aviso: Reproduciendo preview fallback de 30s como último recurso');
+      return UrlSource(track.previewFallbackUrl!);
     }
 
     return null;
@@ -1339,17 +1742,15 @@ class LibreSYProvider extends ChangeNotifier {
 
     try {
       await _audioPlayer.stop();
-      final fullAudioPath = await _resolveAndCacheFullAudio(track);
+      final audioSource = await _resolvePlayableSource(track);
 
       _isBufferingTrack = false;
       notifyListeners();
 
       if (_currentTrack?.id != track.id) return;
 
-      if (fullAudioPath != null && File(fullAudioPath).existsSync()) {
-        await _audioPlayer.play(DeviceFileSource(fullAudioPath));
-      } else if (track.previewFallbackUrl != null && track.previewFallbackUrl!.isNotEmpty) {
-        await _audioPlayer.play(UrlSource(track.previewFallbackUrl!));
+      if (audioSource != null) {
+        await _audioPlayer.play(audioSource);
       }
     } catch (e) {
       _isBufferingTrack = false;
@@ -1720,14 +2121,16 @@ class LibreSYProvider extends ChangeNotifier {
 
     try {
       final saveDir = _getMusicFolder();
-      final ffmpegPath = '${saveDir.path}\\ffmpeg.exe';
+      final ffmpegPath = _findExecutable('ffmpeg.exe');
+      final hasFfmpeg = ffmpegPath != null && File(ffmpegPath).existsSync();
+      final extension = hasFfmpeg ? 'mp3' : 'm4a';
       final safeTitle = track.title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
       final safeArtist = track.artist.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
-      final filePath = '${saveDir.path}\\$safeTitle - $safeArtist.mp3';
+      final filePath = '${saveDir.path}\\$safeTitle - $safeArtist.$extension';
 
       final cachedSourcePath = await _resolveAndCacheFullAudio(track);
       if (cachedSourcePath != null && File(cachedSourcePath).existsSync()) {
-        if (File(ffmpegPath).existsSync()) {
+        if (hasFfmpeg && ffmpegPath != null) {
           await Process.run(
             ffmpegPath,
             [
@@ -1749,7 +2152,7 @@ class LibreSYProvider extends ChangeNotifier {
             id: filePath,
             title: track.title,
             artist: track.artist,
-            album: 'Descargado en MP3',
+            album: hasFfmpeg ? 'Descargado en MP3' : 'Descargado en M4A',
             artworkUrl: track.artworkUrl,
             audioUrl: filePath,
             isLocal: true,
@@ -1857,12 +2260,37 @@ class _LibreSYAppState extends State<LibreSYApp> with WindowListener {
     super.dispose();
   }
 
+  bool _isHandlingWindowMinimize = false;
+
   @override
   void onWindowMinimize() async {
+    if (_isHandlingWindowMinimize) return;
+    _isHandlingWindowMinimize = true;
+    try {
+      final provider = Provider.of<LibreSYProvider>(context, listen: false);
+      if (provider.minimizeToBubbleEnabled && !provider.isMiniBubbleMode) {
+        await windowManager.restore();
+        await Future.delayed(const Duration(milliseconds: 80));
+        await provider.enterMiniBubbleMode();
+      }
+    } finally {
+      _isHandlingWindowMinimize = false;
+    }
+  }
+
+  @override
+  void onWindowMaximize() {
     final provider = Provider.of<LibreSYProvider>(context, listen: false);
-    if (provider.minimizeToBubbleEnabled && !provider.isMiniBubbleMode) {
-      await windowManager.restore();
-      provider.enterMiniBubbleMode();
+    if (provider.isMiniBubbleMode) {
+      provider.exitMiniBubbleMode();
+    }
+  }
+
+  @override
+  void onWindowRestore() {
+    final provider = Provider.of<LibreSYProvider>(context, listen: false);
+    if (provider.isMiniBubbleMode) {
+      provider.exitMiniBubbleMode();
     }
   }
 
@@ -1941,24 +2369,32 @@ class _MiniBubblePlayerViewState extends State<_MiniBubblePlayerView> with Ticke
       }
     }
 
-    final neonPrimary = track != null ? provider.lyricsPrimaryColor : const Color(0xFFFF007F);
-    final neonSecondary = track != null ? provider.lyricsSecondaryColor : const Color(0xFF00E5FF);
-
-    // Cambia automáticamente de estilo con cada canción (o mediante doble clic)
+    // Selección de estilo de aurora y paleta multicolor viva
     final songStyle = (track != null ? track.id.hashCode : 0).abs();
-    final currentAuroraStyle = (songStyle + _manualStyleOffset) % 6;
+    final currentAuroraStyle = (songStyle + _manualStyleOffset) % kAuroraPalettes.length;
+    final activePalette = kAuroraPalettes[currentAuroraStyle];
 
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onPanStart: (details) {
-          windowManager.startDragging();
-        },
-        onDoubleTap: () {
-          setState(() {
-            _manualStyleOffset++;
-          });
+      body: Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent) {
+            if (event.logicalKey == LogicalKeyboardKey.escape) {
+              provider.exitMiniBubbleMode();
+              return KeyEventResult.handled;
+            } else if (event.logicalKey == LogicalKeyboardKey.space) {
+              provider.togglePlayPause();
+              return KeyEventResult.handled;
+            } else if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+              provider.playNext();
+              return KeyEventResult.handled;
+            } else if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+              provider.playPrevious();
+              return KeyEventResult.handled;
+            }
+          }
+          return KeyEventResult.ignored;
         },
         child: Center(
           child: SizedBox(
@@ -1967,7 +2403,7 @@ class _MiniBubblePlayerViewState extends State<_MiniBubblePlayerView> with Ticke
             child: Stack(
               alignment: Alignment.center,
               children: [
-                // 1. Efecto de Aurora Neón Circular (6 estilos dinámicos inspirados en las imágenes)
+                // 1. Efecto de Aurora Neón Circular Multicolor (6 estilos vivos de la imagen)
                 AnimatedBuilder(
                   animation: _auroraController,
                   builder: (context, child) {
@@ -1976,8 +2412,7 @@ class _MiniBubblePlayerViewState extends State<_MiniBubblePlayerView> with Ticke
                       painter: _CircularAuroraPainter(
                         tick: _auroraController.value * 2 * pi,
                         isPlaying: isPlaying,
-                        primaryColor: neonPrimary,
-                        secondaryColor: neonSecondary,
+                        palette: activePalette,
                         radius: 74,
                         style: currentAuroraStyle,
                       ),
@@ -1985,204 +2420,354 @@ class _MiniBubblePlayerViewState extends State<_MiniBubblePlayerView> with Ticke
                   },
                 ),
 
-                // 2. Disco Vinilo con Carátula (Circular puro)
-                RotationTransition(
-                  turns: _vinylController,
-                  child: Container(
-                    width: 148,
-                    height: 148,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      boxShadow: [
-                        BoxShadow(
-                          color: neonPrimary.withValues(alpha: 0.5),
-                          blurRadius: 18,
-                        ),
-                      ],
-                    ),
-                    child: ClipOval(
-                      child: track != null && track.artworkUrl != null && track.artworkUrl!.isNotEmpty
-                          ? (track.artworkUrl!.startsWith('http')
-                              ? Image.network(
-                                  track.artworkUrl!,
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (_, __, ___) => _buildVinylFallback(),
-                                )
-                              : (File(track.artworkUrl!).existsSync()
-                                  ? Image.file(
-                                      File(track.artworkUrl!),
-                                      fit: BoxFit.cover,
-                                    )
-                                  : _buildVinylFallback()))
-                          : _buildVinylFallback(),
-                    ),
-                  ),
-                ),
-
-                // 3. Capa de cristal translúcida interior con degradado oscuro para que los controles y título resalten
-                ClipOval(
-                  child: Container(
-                    width: 148,
-                    height: 148,
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [
-                          Colors.black.withValues(alpha: 0.35),
-                          Colors.black.withValues(alpha: 0.65),
-                          Colors.black.withValues(alpha: 0.90),
-                        ],
-                        stops: const [0.0, 0.45, 1.0],
-                      ),
-                    ),
-                  ),
-                ),
-
-                // 4. Botones de Control de Ventana en el perímetro superior ('-' para agrandar, 'X' para cerrar)
-                Positioned(
-                  top: 55,
-                  left: 64,
-                  child: InkWell(
-                    onTap: () => provider.exitMiniBubbleMode(),
-                    borderRadius: BorderRadius.circular(12),
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.6),
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white30, width: 1),
-                      ),
-                      child: const Icon(Icons.remove, size: 12, color: Colors.white),
-                    ),
-                  ),
-                ),
-                Positioned(
-                  top: 55,
-                  right: 64,
-                  child: InkWell(
-                    onTap: () => windowManager.close(),
-                    borderRadius: BorderRadius.circular(12),
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: BoxDecoration(
-                        color: Colors.redAccent.withValues(alpha: 0.75),
-                        shape: BoxShape.circle,
-                      ),
-                      child: const Icon(Icons.close, size: 12, color: Colors.white),
-                    ),
-                  ),
-                ),
-
-                // 5. Centro del vinilo (mini eje estilizado)
-                Positioned(
-                  top: 95,
-                  child: Container(
-                    width: 12,
-                    height: 12,
-                    decoration: BoxDecoration(
-                      color: Colors.black,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: Colors.white60, width: 1.5),
-                    ),
-                  ),
-                ),
-
-                // 6. Título de la canción y línea separadora roja dentro del círculo (como en el dibujo)
-                Positioned(
-                  bottom: 48,
-                  left: 55,
-                  right: 55,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        track != null ? track.title : 'CYBERMUSIC',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.bold,
-                          shadows: [
-                            Shadow(color: Colors.black, blurRadius: 4),
+                // 2. Disco Vinilo con Carátula (Arrastrable con DragToMoveArea y doble clic para restaurar)
+                DragToMoveArea(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onDoubleTap: () => provider.exitMiniBubbleMode(),
+                    child: RotationTransition(
+                      turns: _vinylController,
+                      child: Container(
+                        width: 148,
+                        height: 148,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: activePalette.primary.withValues(alpha: 0.65),
+                              blurRadius: 18,
+                              spreadRadius: 2,
+                            ),
                           ],
                         ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 3),
-                      // Línea divisora roja (dibujada en rojo por el usuario)
-                      Container(
-                        height: 1.5,
-                        width: 74,
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            colors: [
-                              Colors.transparent,
-                              const Color(0xFFFF2A55),
-                              SpotifyTheme.primary,
-                              Colors.transparent,
-                            ],
-                          ),
+                        child: ClipOval(
+                          child: track != null && track.artworkUrl != null && track.artworkUrl!.isNotEmpty
+                              ? (track.artworkUrl!.startsWith('http')
+                                  ? Image.network(
+                                      track.artworkUrl!,
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (_, __, ___) => _buildVinylFallback(),
+                                    )
+                                  : (File(track.artworkUrl!).existsSync()
+                                      ? Image.file(
+                                          File(track.artworkUrl!),
+                                          fit: BoxFit.cover,
+                                        )
+                                      : _buildVinylFallback()))
+                              : _buildVinylFallback(),
                         ),
                       ),
-                    ],
+                    ),
                   ),
                 ),
 
-                // 7. Botones de Control ⏮️ ⏯️ ⏭️ (sólo figuras, dentro del círculo)
-                Positioned(
-                  bottom: 14,
-                  left: 60,
-                  right: 60,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      // Retroceder canción
-                      InkWell(
-                        onTap: provider.playPrevious,
-                        borderRadius: BorderRadius.circular(12),
-                        child: const Padding(
-                          padding: EdgeInsets.all(2),
-                          child: Icon(Icons.skip_previous_rounded, size: 20, color: Colors.white),
+                // 3. Capa de cristal translúcida interior con degradado oscuro (IgnorePointer para no interferir)
+                IgnorePointer(
+                  child: ClipOval(
+                    child: Container(
+                      width: 148,
+                      height: 148,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.black.withValues(alpha: 0.35),
+                            Colors.black.withValues(alpha: 0.65),
+                            Colors.black.withValues(alpha: 0.90),
+                          ],
+                          stops: const [0.0, 0.45, 1.0],
                         ),
                       ),
+                    ),
+                  ),
+                ),
 
-                      // Pausar / Reproducir con halo neón
-                      InkWell(
-                        onTap: provider.togglePlayPause,
+                // 4. Botones de Control de Ventana (Restaurar, Selector de Estilo y Cerrar)
+                // Botón Restaurar ventana: Icono claro con borde neón
+                Positioned(
+                  top: 52,
+                  left: 56,
+                  child: Tooltip(
+                    message: 'Maximizar / Restaurar ventana (Esc o Doble clic)',
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        onTap: () => provider.exitMiniBubbleMode(),
                         borderRadius: BorderRadius.circular(16),
                         child: Container(
                           padding: const EdgeInsets.all(5),
                           decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.88),
                             shape: BoxShape.circle,
-                            gradient: LinearGradient(
-                              colors: [SpotifyTheme.primary, const Color(0xFFFF2A55)],
-                            ),
+                            border: Border.all(color: const Color(0xFF00E5FF), width: 1.3),
                             boxShadow: [
-                              if (isPlaying)
-                                BoxShadow(
-                                  color: SpotifyTheme.primary.withValues(alpha: 0.6),
-                                  blurRadius: 8,
-                                  spreadRadius: 1,
-                                ),
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.75),
+                                blurRadius: 5,
+                              ),
+                              const BoxShadow(
+                                color: Color(0x6600E5FF),
+                                blurRadius: 4,
+                              ),
                             ],
                           ),
-                          child: Icon(
-                            isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                            size: 18,
-                            color: Colors.black,
+                          child: const Icon(Icons.open_in_full_rounded, size: 12, color: Colors.white),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                // Botón central: Cambiador de estilo de aurora (1-6)
+                Positioned(
+                  top: 52,
+                  child: Tooltip(
+                    message: 'Estilo de Aurora: ${activePalette.name} (Clic para cambiar)',
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        onTap: () {
+                          setState(() {
+                            _manualStyleOffset++;
+                          });
+                        },
+                        borderRadius: BorderRadius.circular(12),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.88),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: activePalette.primary.withValues(alpha: 0.8),
+                              width: 1.1,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.7),
+                                blurRadius: 4,
+                              ),
+                            ],
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.auto_awesome, size: 10, color: activePalette.primary),
+                              const SizedBox(width: 3),
+                              Text(
+                                '${currentAuroraStyle + 1}/6',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                // Botón Cerrar ventana
+                Positioned(
+                  top: 52,
+                  right: 56,
+                  child: Tooltip(
+                    message: 'Cerrar CYBERMUSIC',
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        onTap: () => windowManager.close(),
+                        borderRadius: BorderRadius.circular(16),
+                        child: Container(
+                          padding: const EdgeInsets.all(5),
+                          decoration: BoxDecoration(
+                            color: Colors.redAccent.shade700,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white38, width: 1.2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.75),
+                                blurRadius: 5,
+                              ),
+                              BoxShadow(
+                                color: Colors.redAccent.withValues(alpha: 0.5),
+                                blurRadius: 4,
+                              ),
+                            ],
+                          ),
+                          child: const Icon(Icons.close_rounded, size: 12, color: Colors.white),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                // 5. Centro del vinilo con núcleo neón de color activo
+                IgnorePointer(
+                  child: Center(
+                    child: Container(
+                      width: 13,
+                      height: 13,
+                      decoration: BoxDecoration(
+                        color: Colors.black,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: activePalette.primary, width: 2.0),
+                        boxShadow: [
+                          BoxShadow(
+                            color: activePalette.primary.withValues(alpha: 0.65),
+                            blurRadius: 5,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+                // 6. Título de la canción en cápsula oscura de alto contraste (visible en fondos blancos y oscuros)
+                Positioned(
+                  bottom: 47,
+                  left: 36,
+                  right: 36,
+                  child: IgnorePointer(
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3.5),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.90),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: activePalette.primary.withValues(alpha: 0.55),
+                            width: 1.2,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.85),
+                              blurRadius: 8,
+                              offset: const Offset(0, 2),
+                            ),
+                          ],
+                        ),
+                        child: Text(
+                          track != null ? track.title : 'CYBERMUSIC',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 10.0,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 0.2,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                // 7. Botones de Control ⏮️ ⏯️ ⏭️ en cápsulas de alto contraste para máxima visibilidad
+                Positioned(
+                  bottom: 12,
+                  left: 48,
+                  right: 48,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      // Retroceder canción en cápsula oscura de vidrio
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: provider.playPrevious,
+                          borderRadius: BorderRadius.circular(16),
+                          child: Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.90),
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.40),
+                                width: 1.2,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.75),
+                                  blurRadius: 6,
+                                ),
+                              ],
+                            ),
+                            child: const Icon(
+                              Icons.skip_previous_rounded,
+                              size: 17,
+                              color: Colors.white,
+                            ),
                           ),
                         ),
                       ),
 
-                      // Siguiente canción
-                      InkWell(
-                        onTap: provider.playNext,
-                        borderRadius: BorderRadius.circular(12),
-                        child: const Padding(
-                          padding: EdgeInsets.all(2),
-                          child: Icon(Icons.skip_next_rounded, size: 20, color: Colors.white),
+                      // Pausar / Reproducir con halo neón multicolor
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: provider.togglePlayPause,
+                          borderRadius: BorderRadius.circular(20),
+                          child: Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              gradient: LinearGradient(
+                                colors: [activePalette.primary, activePalette.secondary],
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: activePalette.primary.withValues(alpha: isPlaying ? 0.85 : 0.45),
+                                  blurRadius: 10,
+                                  spreadRadius: 1.5,
+                                ),
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.7),
+                                  blurRadius: 6,
+                                ),
+                              ],
+                            ),
+                            child: Icon(
+                              isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                              size: 19,
+                              color: Colors.black,
+                            ),
+                          ),
+                        ),
+                      ),
+
+                      // Siguiente canción en cápsula oscura de vidrio
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: provider.playNext,
+                          borderRadius: BorderRadius.circular(16),
+                          child: Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.90),
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.40),
+                                width: 1.2,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.75),
+                                  blurRadius: 6,
+                                ),
+                              ],
+                            ),
+                            child: const Icon(
+                              Icons.skip_next_rounded,
+                              size: 17,
+                              color: Colors.white,
+                            ),
+                          ),
                         ),
                       ),
                     ],
@@ -2206,19 +2791,135 @@ class _MiniBubblePlayerViewState extends State<_MiniBubblePlayerView> with Ticke
   }
 }
 
+// ==========================================
+// PALETAS MULTICOLOR VIBRANTES PARA LA AURORA
+// Inspiradas directamente en las ondas y ecualizadores de alta saturación
+// ==========================================
+class AuroraPalette {
+  final String name;
+  final List<Color> colors;
+  final Color primary;
+  final Color secondary;
+
+  const AuroraPalette({
+    required this.name,
+    required this.colors,
+    required this.primary,
+    required this.secondary,
+  });
+}
+
+Color _evalMultiColor(List<Color> colors, double t) {
+  if (colors.isEmpty) return const Color(0xFF00E5FF);
+  if (colors.length == 1) return colors.first;
+  final clampedT = (t % 1.0 + 1.0) % 1.0;
+  final scaled = clampedT * (colors.length - 1);
+  final index = scaled.floor();
+  final remainder = scaled - index;
+  final nextIndex = (index + 1) % colors.length;
+  return Color.lerp(colors[index], colors[nextIndex], remainder) ?? colors[index];
+}
+
+const List<AuroraPalette> kAuroraPalettes = [
+  // 0. Espectro Arcoíris Neón (Multicolor completo)
+  AuroraPalette(
+    name: 'Rainbow Neon',
+    primary: Color(0xFFFF007F),
+    secondary: Color(0xFF00E5FF),
+    colors: [
+      Color(0xFFFF007F), // Magenta Eléctrico
+      Color(0xFFFF5500), // Naranja Neón
+      Color(0xFFFFD000), // Oro Solar
+      Color(0xFF00FF88), // Verde Esmeralda
+      Color(0xFF00E5FF), // Cyan Eléctrico
+      Color(0xFF7000FF), // Violeta Brillante
+      Color(0xFFFF007F), // Cierre cíclico 360°
+    ],
+  ),
+
+  // 1. Cintas Armónicas Multicolor (Ondas fluidas cyan-amarillo-fucsia)
+  AuroraPalette(
+    name: 'Harmonic Flow',
+    primary: Color(0xFF00E5FF),
+    secondary: Color(0xFFFF00C8),
+    colors: [
+      Color(0xFF00E5FF), // Cyan
+      Color(0xFF0088FF), // Azul Eléctrico
+      Color(0xFFFF00C8), // Magenta
+      Color(0xFFFF8800), // Naranja
+      Color(0xFFFFEE00), // Amarillo Solar
+      Color(0xFF00E5FF),
+    ],
+  ),
+
+  // 2. Bloques Segmentados Cyan & Toxic Lime (Ecualizador digital)
+  AuroraPalette(
+    name: 'Cyber Matrix',
+    primary: Color(0xFF00FF88),
+    secondary: Color(0xFF00E5FF),
+    colors: [
+      Color(0xFF00E5FF), // Cyan
+      Color(0xFF00FF88), // Verde Neón
+      Color(0xFF76FF03), // Lima Eléctrica
+      Color(0xFF00FFFF), // Turquesa
+      Color(0xFF00E5FF),
+    ],
+  ),
+
+  // 3. Vórtice Galáctico Deep Azure & Violet
+  AuroraPalette(
+    name: 'Cosmic Vortex',
+    primary: Color(0xFF0055FF),
+    secondary: Color(0xFFA855F7),
+    colors: [
+      Color(0xFF0055FF), // Azul Profundo
+      Color(0xFF00E5FF), // Cyan
+      Color(0xFFA855F7), // Púrpura Eléctrico
+      Color(0xFFFF0080), // Rosa Neón
+      Color(0xFF0055FF),
+    ],
+  ),
+
+  // 4. Constelación de Puntos Synthwave
+  AuroraPalette(
+    name: 'Synthwave Dots',
+    primary: Color(0xFFFF00AA),
+    secondary: Color(0xFF00FFCC),
+    colors: [
+      Color(0xFFFF00AA), // Rosa Synth
+      Color(0xFF00FFCC), // Menta Neón
+      Color(0xFFFFD600), // Amarillo Neón
+      Color(0xFF7000FF), // Violeta
+      Color(0xFFFF00AA),
+    ],
+  ),
+
+  // 5. Corona Solar & Bicolor de Alta Frecuencia
+  AuroraPalette(
+    name: 'Solar Flare',
+    primary: Color(0xFFFF1744),
+    secondary: Color(0xFFFF9100),
+    colors: [
+      Color(0xFFFF1744), // Rojo Fuego
+      Color(0xFFFF5252), // Coral
+      Color(0xFFFF9100), // Naranja Oro
+      Color(0xFFFFD600), // Amarillo Fuego
+      Color(0xFFFF1744),
+    ],
+  ),
+];
+
 class _CircularAuroraPainter extends CustomPainter {
   final double tick;
   final bool isPlaying;
-  final Color primaryColor;
-  final Color secondaryColor;
+  final AuroraPalette palette;
   final double radius;
   final int style; // 0 a 5 recreando cada estilo de las referencias
 
   _CircularAuroraPainter({
     required this.tick,
     required this.isPlaying,
-    required this.primaryColor,
-    required this.secondaryColor,
+    required this.palette,
     required this.radius,
     required this.style,
   });
@@ -2227,28 +2928,33 @@ class _CircularAuroraPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
 
-    // 1. Anillo Neón Central brillante
+    // 0. Sombra suave de contraste detrás de la aurora para que resalte intensamente sobre fondos blancos
+    final backingPaint = Paint()
+      ..color = Colors.black.withValues(alpha: 0.38)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 16);
+    canvas.drawCircle(center, radius + 22, backingPaint);
+
+    // 1. Anillo Neón Central Multicolor brillante
     final ringPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.4
+      ..strokeWidth = 2.6
       ..shader = ui.Gradient.sweep(
         center,
-        [
-          primaryColor,
-          secondaryColor,
-          const Color(0xFFFF007F),
-          primaryColor,
-        ],
-        [0.0, 0.45, 0.8, 1.0],
+        palette.colors,
+        List.generate(palette.colors.length, (i) => i / (palette.colors.length - 1)),
       );
     canvas.drawCircle(center, radius, ringPaint);
 
     // Resplandor difuso del anillo
     final glowRingPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 5.0
-      ..color = primaryColor.withValues(alpha: isPlaying ? 0.35 : 0.15)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 5);
+      ..strokeWidth = 6.0
+      ..shader = ui.Gradient.sweep(
+        center,
+        palette.colors.map((c) => c.withValues(alpha: isPlaying ? 0.45 : 0.25)).toList(),
+        List.generate(palette.colors.length, (i) => i / (palette.colors.length - 1)),
+      )
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
     canvas.drawCircle(center, radius, glowRingPaint);
 
     switch (style % 6) {
@@ -2275,10 +2981,11 @@ class _CircularAuroraPainter extends CustomPainter {
     }
   }
 
-  // Estilo 0: Rayos Neón Clásicos con Partículas (Imagen 2 de referencia)
+  // Estilo 0: Rayos Solares Neón Multicolor con Partículas (Imagen 2 de referencia)
   void _paintClassicRays(Canvas canvas, Offset center) {
     const int barCount = 76;
     for (int i = 0; i < barCount; i++) {
+      final t = i / barCount;
       final angle = i * (2 * pi / barCount);
       final cosA = cos(angle);
       final sinA = sin(angle);
@@ -2293,35 +3000,35 @@ class _CircularAuroraPainter extends CustomPainter {
       final startPos = center + Offset(cosA * (radius + 2), sinA * (radius + 2));
       final endPos = center + Offset(cosA * (radius + 2 + rayLength), sinA * (radius + 2 + rayLength));
 
-      final barColor = Color.lerp(primaryColor, secondaryColor, i / barCount) ?? primaryColor;
+      final barColor = _evalMultiColor(palette.colors, t);
 
       final rayPaint = Paint()
-        ..strokeWidth = 1.8
+        ..strokeWidth = 2.2
         ..strokeCap = StrokeCap.round
         ..shader = ui.Gradient.linear(
           startPos,
           endPos,
-          [barColor.withValues(alpha: 0.95), barColor.withValues(alpha: 0.20)],
+          [barColor.withValues(alpha: 1.0), barColor.withValues(alpha: 0.30)],
         );
 
       canvas.drawLine(startPos, endPos, rayPaint);
 
       // Partículas flotantes suaves
-      if (i % 3 == 0) {
-        final particleDist = radius + rayLength + 4.0 + (sin(tick + i) * 2.0);
+      if (i % 2 == 0) {
+        final particleDist = radius + rayLength + 4.5 + (sin(tick * 1.5 + i) * 2.5);
         final particlePos = center + Offset(cosA * particleDist, sinA * particleDist);
-        final particleAlpha = (combined * 0.7 + 0.2).clamp(0.2, 0.85);
+        final particleAlpha = (combined * 0.7 + 0.3).clamp(0.3, 0.95);
 
         canvas.drawCircle(
           particlePos,
-          1.2,
-          Paint()..color = Colors.white.withValues(alpha: particleAlpha),
+          1.5,
+          Paint()..color = barColor.withValues(alpha: particleAlpha),
         );
       }
     }
   }
 
-  // Estilo 1: Cintas Armónicas Onduladas (Imagen 3 - Ribbon Waves)
+  // Estilo 1: Cintas Armónicas Onduladas Multicolor (Imagen 2 - Ribbon Waves)
   void _paintConcentricRibbons(Canvas canvas, Offset center) {
     const int ribbonCount = 3;
     for (int r = 0; r < ribbonCount; r++) {
@@ -2343,21 +3050,23 @@ class _CircularAuroraPainter extends CustomPainter {
       }
       path.close();
 
-      final ribbonColor = Color.lerp(primaryColor, secondaryColor, r / ribbonCount) ?? primaryColor;
+      final ribbonColor = _evalMultiColor(palette.colors, r / ribbonCount);
       final p = Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.6
-        ..color = ribbonColor.withValues(alpha: (0.75 - r * 0.18).clamp(0.2, 0.9));
+        ..strokeWidth = 2.0
+        ..color = ribbonColor.withValues(alpha: (0.90 - r * 0.15).clamp(0.4, 0.95))
+        ..maskFilter = const MaskFilter.blur(BlurStyle.solid, 1.0);
       canvas.drawPath(path, p);
     }
   }
 
-  // Estilo 2: Ecualizador de Bloques / Segmentos Radiales (Imagen 3 - Segmented Dots)
+  // Estilo 2: Ecualizador de Bloques / Segmentos Radiales (Imagen 2 - Segmented Dots)
   void _paintSegmentedBars(Canvas canvas, Offset center) {
     const int barCount = 44;
     const int segments = 5;
 
     for (int i = 0; i < barCount; i++) {
+      final t = i / barCount;
       final angle = i * (2 * pi / barCount);
       final cosA = cos(angle);
       final sinA = sin(angle);
@@ -2371,22 +3080,23 @@ class _CircularAuroraPainter extends CustomPainter {
         final pt = center + Offset(cosA * dist, sinA * dist);
         final isActive = s < energy;
 
-        final color = Color.lerp(primaryColor, secondaryColor, s / segments) ?? primaryColor;
-        final alpha = isActive ? 0.95 : 0.15;
+        final color = _evalMultiColor(palette.colors, (t + (s / segments) * 0.3) % 1.0);
+        final alpha = isActive ? 1.0 : 0.22;
 
         canvas.drawCircle(
           pt,
-          1.5,
+          1.8,
           Paint()..color = color.withValues(alpha: alpha),
         );
       }
     }
   }
 
-  // Estilo 3: Vórtice Curvado / Spiral Starburst (Imagen 3 - Vortex Spikes)
+  // Estilo 3: Vórtice Curvado / Spiral Starburst (Imagen 2 - Vortex Spikes)
   void _paintVortexSpikes(Canvas canvas, Offset center) {
     const int barCount = 64;
     for (int i = 0; i < barCount; i++) {
+      final t = i / barCount;
       final baseAngle = i * (2 * pi / barCount);
       final freq = sin(i * 0.3 + tick * 1.4) * 0.5 + 0.5;
       final rayLength = isPlaying ? (6.0 + freq * 24.0) : 5.0;
@@ -2395,45 +3105,47 @@ class _CircularAuroraPainter extends CustomPainter {
       final curveAngle = baseAngle + 0.22 + (freq * 0.08);
       final endPos = center + Offset(cos(curveAngle) * (radius + 2 + rayLength), sin(curveAngle) * (radius + 2 + rayLength));
 
-      final barColor = Color.lerp(secondaryColor, primaryColor, i / barCount) ?? secondaryColor;
+      final barColor = _evalMultiColor(palette.colors, t);
       final paint = Paint()
-        ..strokeWidth = 1.7
+        ..strokeWidth = 2.0
         ..strokeCap = StrokeCap.round
         ..shader = ui.Gradient.linear(
           startPos,
           endPos,
-          [barColor.withValues(alpha: 0.95), barColor.withValues(alpha: 0.15)],
+          [barColor.withValues(alpha: 1.0), barColor.withValues(alpha: 0.25)],
         );
       canvas.drawLine(startPos, endPos, paint);
     }
   }
 
-  // Estilo 4: Constelación de Micro-Puntos en Órbita (Imagen 3 - Dotted Orbital)
+  // Estilo 4: Constelación de Micro-Puntos en Órbita (Imagen 2 - Dotted Orbital)
   void _paintDottedOrbital(Canvas canvas, Offset center) {
     const int dotCount = 80;
     final phase = tick * 1.2;
 
     for (int i = 0; i < dotCount; i++) {
+      final t = i / dotCount;
       final angle = i * (2 * pi / dotCount);
       final wave1 = sin(angle * 4 + phase);
       final wave2 = cos(angle * 2 - phase * 0.7);
       final d = radius + 6.0 + (isPlaying ? (wave1 * 10.0 + wave2 * 6.0 + 8.0) : 7.0);
 
       final pt = center + Offset(cos(angle) * d, sin(angle) * d);
-      final color = Color.lerp(primaryColor, secondaryColor, (sin(angle + phase) * 0.5 + 0.5)) ?? primaryColor;
+      final color = _evalMultiColor(palette.colors, (t + phase * 0.1) % 1.0);
 
       canvas.drawCircle(
         pt,
-        1.7,
-        Paint()..color = color.withValues(alpha: 0.85),
+        2.0,
+        Paint()..color = color.withValues(alpha: 0.95),
       );
     }
   }
 
-  // Estilo 5: Corona de Espigas Bicolor (Imagen 3 - Dual-Tone Corona)
+  // Estilo 5: Corona de Espigas Bicolor (Imagen 2 - Dual-Tone Corona)
   void _paintDualToneCorona(Canvas canvas, Offset center) {
     const int barCount = 90;
     for (int i = 0; i < barCount; i++) {
+      final t = i / barCount;
       final angle = i * (2 * pi / barCount);
       final isEven = i % 2 == 0;
       final freq = sin(i * 0.5 + tick * 1.6) * 0.5 + 0.5;
@@ -2444,11 +3156,15 @@ class _CircularAuroraPainter extends CustomPainter {
       final startPos = center + Offset(cos(angle) * (radius + 2), sin(angle) * (radius + 2));
       final endPos = center + Offset(cos(angle) * (radius + 2 + rayLength), sin(angle) * (radius + 2 + rayLength));
 
-      final color = isEven ? primaryColor : secondaryColor;
+      final color = isEven ? _evalMultiColor(palette.colors, t) : palette.secondary;
       final paint = Paint()
-        ..strokeWidth = isEven ? 1.9 : 1.3
+        ..strokeWidth = isEven ? 2.0 : 1.4
         ..strokeCap = StrokeCap.round
-        ..color = color.withValues(alpha: isEven ? 0.9 : 0.6);
+        ..shader = ui.Gradient.linear(
+          startPos,
+          endPos,
+          [color.withValues(alpha: 1.0), color.withValues(alpha: 0.25)],
+        );
 
       canvas.drawLine(startPos, endPos, paint);
     }
@@ -2456,6 +3172,231 @@ class _CircularAuroraPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _CircularAuroraPainter oldDelegate) => true;
+}
+
+// ==========================================
+// BARRA SUPERIOR DE VENTANA PERSONALIZADA (DARK SEAMLESS)
+// Reemplaza la barra blanca de Windows para unificar la estética
+// ==========================================
+class _CustomAppTitleBar extends StatefulWidget {
+  const _CustomAppTitleBar();
+
+  @override
+  State<_CustomAppTitleBar> createState() => _CustomAppTitleBarState();
+}
+
+class _CustomAppTitleBarState extends State<_CustomAppTitleBar> with WindowListener {
+  bool _isMaximized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    windowManager.addListener(this);
+    _checkMaximizedState();
+  }
+
+  @override
+  void dispose() {
+    windowManager.removeListener(this);
+    super.dispose();
+  }
+
+  void _checkMaximizedState() async {
+    final max = await windowManager.isMaximized();
+    if (mounted) setState(() => _isMaximized = max);
+  }
+
+  @override
+  void onWindowMaximize() {
+    if (mounted) setState(() => _isMaximized = true);
+  }
+
+  @override
+  void onWindowUnmaximize() {
+    if (mounted) setState(() => _isMaximized = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<LibreSYProvider>(context);
+
+    return Container(
+      height: 38,
+      decoration: BoxDecoration(
+        color: SpotifyTheme.background.withValues(alpha: 0.35),
+        border: Border(
+          bottom: BorderSide(
+            color: Colors.white.withValues(alpha: 0.06),
+            width: 1,
+          ),
+        ),
+      ),
+      child: Row(
+        children: [
+          // Logo & Título de la app a la izquierda
+          GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onDoubleTap: () async {
+              if (await windowManager.isMaximized()) {
+                await windowManager.unmaximize();
+              } else {
+                await windowManager.maximize();
+              }
+            },
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(width: 14),
+                Container(
+                  width: 20,
+                  height: 20,
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [const Color(0xFF00FFA3), SpotifyTheme.primary],
+                    ),
+                    borderRadius: BorderRadius.circular(5),
+                    boxShadow: [
+                      BoxShadow(
+                        color: SpotifyTheme.primary.withValues(alpha: 0.4),
+                        blurRadius: 6,
+                      ),
+                    ],
+                  ),
+                  child: const Icon(Icons.graphic_eq, color: Colors.black, size: 13),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'CYBERMUSIC',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.6,
+                  ),
+                ),
+                const SizedBox(width: 14),
+              ],
+            ),
+          ),
+
+          // Área arrastrable central para mover la ventana
+          Expanded(
+            child: DragToMoveArea(
+              child: Container(
+                color: Colors.transparent,
+                alignment: Alignment.centerLeft,
+                child: provider.currentTrack != null
+                    ? Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            provider.isPlaying ? Icons.play_arrow : Icons.pause,
+                            color: SpotifyTheme.primary.withValues(alpha: 0.6),
+                            size: 13,
+                          ),
+                          const SizedBox(width: 6),
+                          Flexible(
+                            child: Text(
+                              '${provider.currentTrack!.artist} — ${provider.currentTrack!.title}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.45),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                        ],
+                      )
+                    : const SizedBox.expand(),
+              ),
+            ),
+          ),
+
+          // Botones de control de ventana de Windows integrados estéticamente
+          _WindowActionButton(
+            icon: const Icon(Icons.remove, size: 15, color: Colors.white70),
+            tooltip: 'Minimizar',
+            onTap: () {
+              final provider = Provider.of<LibreSYProvider>(context, listen: false);
+              if (provider.minimizeToBubbleEnabled) {
+                provider.enterMiniBubbleMode();
+              } else {
+                windowManager.minimize();
+              }
+            },
+          ),
+          _WindowActionButton(
+            icon: Icon(
+              _isMaximized ? Icons.filter_none : Icons.crop_square,
+              size: _isMaximized ? 12 : 14,
+              color: Colors.white70,
+            ),
+            tooltip: _isMaximized ? 'Restaurar' : 'Maximizar',
+            onTap: () async {
+              if (await windowManager.isMaximized()) {
+                await windowManager.unmaximize();
+              } else {
+                await windowManager.maximize();
+              }
+            },
+          ),
+          _WindowActionButton(
+            icon: const Icon(Icons.close, size: 16, color: Colors.white70),
+            tooltip: 'Cerrar',
+            isClose: true,
+            onTap: () => windowManager.close(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WindowActionButton extends StatefulWidget {
+  final Widget icon;
+  final VoidCallback onTap;
+  final String tooltip;
+  final bool isClose;
+
+  const _WindowActionButton({
+    required this.icon,
+    required this.onTap,
+    required this.tooltip,
+    this.isClose = false,
+  });
+
+  @override
+  State<_WindowActionButton> createState() => _WindowActionButtonState();
+}
+
+class _WindowActionButtonState extends State<_WindowActionButton> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: widget.tooltip,
+      waitDuration: const Duration(milliseconds: 600),
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: Container(
+            width: 44,
+            height: 38,
+            color: _hovered
+                ? (widget.isClose ? const Color(0xFFE81123) : Colors.white.withValues(alpha: 0.12))
+                : Colors.transparent,
+            alignment: Alignment.center,
+            child: widget.icon,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class MainLayoutScreen extends StatelessWidget {
@@ -2482,6 +3423,7 @@ class MainLayoutScreen extends StatelessWidget {
 
                 return Column(
                   children: [
+                    const _CustomAppTitleBar(),
                     Expanded(
                       child: Row(
                         children: [
@@ -2499,6 +3441,7 @@ class MainLayoutScreen extends StatelessWidget {
                                 _FavoritesView(),
                                 _LyricsSyncedView(),
                                 _ProfileView(),
+                                _ArtistProfileView(),
                               ],
                             ),
                           ),
@@ -3404,11 +4347,10 @@ class _RightNowPlayingSidebar extends StatelessWidget {
                                   overflow: TextOverflow.ellipsis,
                                 ),
                                 const SizedBox(height: 4),
-                                Text(
-                                  track.artist,
+                                ArtistClickableText(
+                                  artist: track.artist,
+                                  avatarUrl: track.artworkUrl,
                                   style: TextStyle(fontSize: 13, color: SpotifyTheme.lightGray),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
                                 ),
                               ],
                             ),
@@ -3572,11 +4514,10 @@ class _RightNowPlayingSidebar extends StatelessWidget {
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
                                         ),
-                                        Text(
-                                          qTrack.artist,
+                                        ArtistClickableText(
+                                          artist: qTrack.artist,
+                                          avatarUrl: qTrack.artworkUrl,
                                           style: const TextStyle(fontSize: 10.5, color: Colors.white54),
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
                                         ),
                                       ],
                                     ),
@@ -4922,124 +5863,34 @@ class _HomeView extends StatelessWidget {
 
               // Sección Canciones Populares de Hoy (Algoritmo de Tendencias Diarias)
               SliverToBoxAdapter(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(24, 28, 24, 14),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Row(
-                            children: [
-                              Icon(Icons.local_fire_department, color: Colors.orangeAccent, size: 22),
-                              SizedBox(width: 8),
-                              Text('Canciones Populares del Día (Top Hits Globales)', style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
-                            ],
-                          ),
-                          IconButton(
-                            icon: Icon(Icons.refresh, color: SpotifyTheme.lightGray, size: 20),
-                            tooltip: 'Actualizar canciones populares',
-                            onPressed: () => provider.fetchDailyPopularTracks(),
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (provider.isLoadingPopular)
-                      SizedBox(
-                        height: 225,
-                        child: Center(child: CircularProgressIndicator(color: SpotifyTheme.primary)),
-                      )
-                    else if (provider.popularTracks.isNotEmpty)
-                      SizedBox(
-                        height: 225,
-                        child: ListView.separated(
-                          padding: const EdgeInsets.symmetric(horizontal: 24),
-                          scrollDirection: Axis.horizontal,
-                          itemCount: provider.popularTracks.length,
-                          separatorBuilder: (context, index) => const SizedBox(width: 16),
-                          itemBuilder: (context, index) {
-                            final track = provider.popularTracks[index];
-                            return _TrackCardItem(track: track);
-                          },
-                        ),
-                      ),
-                  ],
+                child: _HorizontalTrackSection(
+                  title: 'Canciones Populares del Día (Top Hits Globales)',
+                  icon: const Icon(Icons.local_fire_department, color: Colors.orangeAccent, size: 22),
+                  tracks: provider.popularTracks,
+                  isLoading: provider.isLoadingPopular,
+                  refreshTooltip: 'Actualizar canciones populares',
+                  onRefresh: () => provider.fetchDailyPopularTracks(),
                 ),
               ),
 
               // Sección Recomendadas para ti (Similares a lo que escuchas)
               SliverToBoxAdapter(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(24, 28, 24, 14),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Row(
-                            children: [
-                              Icon(Icons.auto_awesome, color: SpotifyTheme.primary, size: 22),
-                              const SizedBox(width: 8),
-                              const Text('Recomendadas para ti (Basadas en tus gustos)', style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
-                            ],
-                          ),
-                          IconButton(
-                            icon: Icon(Icons.refresh, color: SpotifyTheme.lightGray, size: 20),
-                            tooltip: 'Generar nuevas recomendaciones',
-                            onPressed: () => provider.fetchRecommendedTracks(),
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (provider.isLoadingRecommendations)
-                      SizedBox(
-                        height: 225,
-                        child: Center(child: CircularProgressIndicator(color: SpotifyTheme.primary)),
-                      )
-                    else if (provider.recommendedTracks.isNotEmpty)
-                      SizedBox(
-                        height: 225,
-                        child: ListView.separated(
-                          padding: const EdgeInsets.symmetric(horizontal: 24),
-                          scrollDirection: Axis.horizontal,
-                          itemCount: provider.recommendedTracks.length,
-                          separatorBuilder: (context, index) => const SizedBox(width: 16),
-                          itemBuilder: (context, index) {
-                            final track = provider.recommendedTracks[index];
-                            return _TrackCardItem(track: track);
-                          },
-                        ),
-                      ),
-                  ],
+                child: _HorizontalTrackSection(
+                  title: 'Recomendadas para ti (Basadas en tus gustos)',
+                  icon: Icon(Icons.auto_awesome, color: SpotifyTheme.primary, size: 22),
+                  tracks: provider.recommendedTracks,
+                  isLoading: provider.isLoadingRecommendations,
+                  refreshTooltip: 'Generar nuevas recomendaciones',
+                  onRefresh: () => provider.fetchRecommendedTracks(),
                 ),
               ),
 
               // Sección Reproducido Recientemente (si hay historial)
               if (provider.recentlyPlayed.isNotEmpty)
                 SliverToBoxAdapter(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Padding(
-                        padding: EdgeInsets.fromLTRB(24, 28, 24, 14),
-                        child: Text('Reproducido recientemente', style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
-                      ),
-                      SizedBox(
-                        height: 225,
-                        child: ListView.separated(
-                          padding: const EdgeInsets.symmetric(horizontal: 24),
-                          scrollDirection: Axis.horizontal,
-                          itemCount: provider.recentlyPlayed.take(10).length,
-                          separatorBuilder: (context, index) => const SizedBox(width: 16),
-                          itemBuilder: (context, index) {
-                            final track = provider.recentlyPlayed[index];
-                            return _TrackCardItem(track: track);
-                          },
-                        ),
-                      ),
-                    ],
+                  child: _HorizontalTrackSection(
+                    title: 'Reproducido recientemente',
+                    tracks: provider.recentlyPlayed.take(10).toList(),
                   ),
                 ),
 
@@ -5075,6 +5926,252 @@ class _HomeView extends StatelessWidget {
     }
     final firstName = name.split(' ').first;
     return '$prefix, $firstName!';
+  }
+}
+
+// ==========================================
+// SECCIÓN HORIZONTAL CON BARRITA DESLIZANTE VISIBLE Y FLECHAS < >
+// Permite arrastrar la barra y usar flechas para explorar más canciones
+// ==========================================
+class _HorizontalTrackSection extends StatefulWidget {
+  final String title;
+  final Widget? icon;
+  final List<Track> tracks;
+  final bool isLoading;
+  final VoidCallback? onRefresh;
+  final String? refreshTooltip;
+
+  const _HorizontalTrackSection({
+    required this.title,
+    this.icon,
+    required this.tracks,
+    this.isLoading = false,
+    this.onRefresh,
+    this.refreshTooltip,
+  });
+
+  @override
+  State<_HorizontalTrackSection> createState() => _HorizontalTrackSectionState();
+}
+
+class _HorizontalTrackSectionState extends State<_HorizontalTrackSection> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollBy(double offset) {
+    if (!_scrollController.hasClients) return;
+    final target = (_scrollController.offset + offset).clamp(
+      0.0,
+      _scrollController.position.maxScrollExtent,
+    );
+    _scrollController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Encabezado de la sección con título, flechas de navegación < > y refresco
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 28, 24, 12),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  if (widget.icon != null) ...[
+                    widget.icon!,
+                    const SizedBox(width: 8),
+                  ],
+                  Text(
+                    widget.title,
+                    style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              Row(
+                children: [
+                  _SectionScrollArrow(
+                    icon: Icons.chevron_left,
+                    tooltip: 'Desplazar a la izquierda',
+                    onTap: () => _scrollBy(-340),
+                  ),
+                  const SizedBox(width: 6),
+                  _SectionScrollArrow(
+                    icon: Icons.chevron_right,
+                    tooltip: 'Desplazar a la derecha',
+                    onTap: () => _scrollBy(340),
+                  ),
+                  if (widget.onRefresh != null) ...[
+                    const SizedBox(width: 8),
+                    IconButton(
+                      icon: Icon(Icons.refresh, color: SpotifyTheme.lightGray, size: 20),
+                      tooltip: widget.refreshTooltip ?? 'Actualizar',
+                      onPressed: widget.onRefresh,
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ),
+        ),
+
+        // Contenedor con Barrita de Desplazamiento Horizontal Visible (RawScrollbar interactivo)
+        if (widget.isLoading)
+          SizedBox(
+            height: 242,
+            child: Center(child: CircularProgressIndicator(color: SpotifyTheme.primary)),
+          )
+        else if (widget.tracks.isNotEmpty)
+          SizedBox(
+            height: 242,
+            child: RawScrollbar(
+              controller: _scrollController,
+              thumbVisibility: true,
+              trackVisibility: true,
+              interactive: true,
+              thickness: 7,
+              radius: const Radius.circular(4),
+              thumbColor: SpotifyTheme.primary.withValues(alpha: 0.65),
+              trackColor: Colors.white.withValues(alpha: 0.08),
+              trackBorderColor: Colors.transparent,
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 0),
+              child: ScrollConfiguration(
+                behavior: ScrollConfiguration.of(context).copyWith(
+                  dragDevices: {
+                    PointerDeviceKind.touch,
+                    PointerDeviceKind.mouse,
+                    PointerDeviceKind.trackpad,
+                  },
+                ),
+                child: ListView.separated(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
+                  scrollDirection: Axis.horizontal,
+                  itemCount: widget.tracks.length,
+                  separatorBuilder: (context, index) => const SizedBox(width: 16),
+                  itemBuilder: (context, index) {
+                    final track = widget.tracks[index];
+                    return _TrackCardItem(track: track);
+                  },
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _SectionScrollArrow extends StatefulWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  const _SectionScrollArrow({
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  @override
+  State<_SectionScrollArrow> createState() => _SectionScrollArrowState();
+}
+
+class _SectionScrollArrowState extends State<_SectionScrollArrow> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: widget.tooltip,
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _hovered ? Colors.white.withValues(alpha: 0.18) : Colors.white.withValues(alpha: 0.07),
+              border: Border.all(
+                color: _hovered ? SpotifyTheme.primary.withValues(alpha: 0.5) : Colors.white.withValues(alpha: 0.12),
+              ),
+            ),
+            child: Icon(widget.icon, color: _hovered ? SpotifyTheme.primary : Colors.white70, size: 19),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ArtistClickableText extends StatefulWidget {
+  final String artist;
+  final String? avatarUrl;
+  final TextStyle? style;
+  final int maxLines;
+
+  const ArtistClickableText({
+    super.key,
+    required this.artist,
+    this.avatarUrl,
+    this.style,
+    this.maxLines = 1,
+  });
+
+  @override
+  State<ArtistClickableText> createState() => _ArtistClickableTextState();
+}
+
+class _ArtistClickableTextState extends State<ArtistClickableText> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.artist.isEmpty || widget.artist == 'Archivo de tu PC') {
+      return Text(
+        widget.artist,
+        style: widget.style,
+        maxLines: widget.maxLines,
+        overflow: TextOverflow.ellipsis,
+      );
+    }
+
+    final defaultStyle = widget.style ?? TextStyle(color: SpotifyTheme.lightGray, fontSize: 11);
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: GestureDetector(
+        onTap: () {
+          final provider = Provider.of<LibreSYProvider>(context, listen: false);
+          provider.openArtistProfile(widget.artist, avatarUrl: widget.avatarUrl);
+        },
+        child: Text(
+          widget.artist,
+          style: defaultStyle.copyWith(
+            color: _isHovered ? Colors.white : defaultStyle.color,
+            decoration: _isHovered ? TextDecoration.underline : TextDecoration.none,
+          ),
+          maxLines: widget.maxLines,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
+    );
   }
 }
 
@@ -5137,11 +6234,10 @@ class _TrackCardItem extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
             const SizedBox(height: 4),
-            Text(
-              track.artist,
+            ArtistClickableText(
+              artist: track.artist,
+              avatarUrl: track.artworkUrl,
               style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 11),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),
@@ -5159,11 +6255,37 @@ class _TrackCardItem extends StatelessWidget {
   }
 }
 
-class _HomeImageCarousel extends StatelessWidget {
+class _HomeImageCarousel extends StatefulWidget {
   final String title;
   final List<HomeHighlightItem> items;
 
   const _HomeImageCarousel({required this.title, required this.items});
+
+  @override
+  State<_HomeImageCarousel> createState() => _HomeImageCarouselState();
+}
+
+class _HomeImageCarouselState extends State<_HomeImageCarousel> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollBy(double offset) {
+    if (!_scrollController.hasClients) return;
+    final target = (_scrollController.offset + offset).clamp(
+      0.0,
+      _scrollController.position.maxScrollExtent,
+    );
+    _scrollController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -5173,85 +6295,127 @@ class _HomeImageCarousel extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(24, 28, 24, 14),
-          child: Text(title, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
+          padding: const EdgeInsets.fromLTRB(24, 28, 24, 12),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(widget.title, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
+              Row(
+                children: [
+                  _SectionScrollArrow(
+                    icon: Icons.chevron_left,
+                    tooltip: 'Desplazar a la izquierda',
+                    onTap: () => _scrollBy(-340),
+                  ),
+                  const SizedBox(width: 6),
+                  _SectionScrollArrow(
+                    icon: Icons.chevron_right,
+                    tooltip: 'Desplazar a la derecha',
+                    onTap: () => _scrollBy(340),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
         SizedBox(
-          height: 225,
-          child: ListView.separated(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
-            scrollDirection: Axis.horizontal,
-            itemCount: items.length,
-            separatorBuilder: (context, index) => const SizedBox(width: 16),
-            itemBuilder: (context, index) {
-              final item = items[index];
-              return InkWell(
-                onTap: () {
-                  provider.setTab(1);
-                  provider.searchOnline(item.query);
+          height: 242,
+          child: RawScrollbar(
+            controller: _scrollController,
+            thumbVisibility: true,
+            trackVisibility: true,
+            interactive: true,
+            thickness: 7,
+            radius: const Radius.circular(4),
+            thumbColor: SpotifyTheme.primary.withValues(alpha: 0.65),
+            trackColor: Colors.white.withValues(alpha: 0.08),
+            trackBorderColor: Colors.transparent,
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 0),
+            child: ScrollConfiguration(
+              behavior: ScrollConfiguration.of(context).copyWith(
+                dragDevices: {
+                  PointerDeviceKind.touch,
+                  PointerDeviceKind.mouse,
+                  PointerDeviceKind.trackpad,
                 },
-                borderRadius: BorderRadius.circular(10),
-                child: Container(
-                  width: 160,
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: SpotifyTheme.card,
+              ),
+              child: ListView.separated(
+                controller: _scrollController,
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
+                scrollDirection: Axis.horizontal,
+                itemCount: widget.items.length,
+                separatorBuilder: (context, index) => const SizedBox(width: 16),
+                itemBuilder: (context, index) {
+                  final item = widget.items[index];
+                  return InkWell(
+                    onTap: () {
+                      provider.setTab(1);
+                      provider.searchOnline(item.query);
+                    },
                     borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Stack(
+                    child: Container(
+                      width: 160,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: SpotifyTheme.card,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(8),
-                            child: Image.network(
-                              item.imageUrl,
-                              width: 136,
-                              height: 136,
-                              fit: BoxFit.cover,
-                              errorBuilder: (context, error, stackTrace) => Container(
-                                width: 136,
-                                height: 136,
-                                color: SpotifyTheme.darkGray,
-                                child: const Icon(Icons.album, color: Colors.white54, size: 50),
+                          Stack(
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.network(
+                                  item.imageUrl,
+                                  width: 136,
+                                  height: 136,
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (context, error, stackTrace) => Container(
+                                    width: 136,
+                                    height: 136,
+                                    color: SpotifyTheme.darkGray,
+                                    child: const Icon(Icons.album, color: Colors.white54, size: 50),
+                                  ),
+                                ),
                               ),
-                            ),
+                              Positioned(
+                                right: 8,
+                                bottom: 8,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color: SpotifyTheme.primary,
+                                    shape: BoxShape.circle,
+                                    boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 6)],
+                                  ),
+                                  padding: const EdgeInsets.all(7),
+                                  child: const Icon(Icons.play_arrow, color: Colors.black, size: 20),
+                                ),
+                              ),
+                            ],
                           ),
-                          Positioned(
-                            right: 8,
-                            bottom: 8,
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: SpotifyTheme.primary,
-                                shape: BoxShape.circle,
-                                boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 6)],
-                              ),
-                              padding: const EdgeInsets.all(7),
-                              child: const Icon(Icons.play_arrow, color: Colors.black, size: 20),
-                            ),
+                          const SizedBox(height: 10),
+                          Text(
+                            item.title,
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            item.subtitle,
+                            style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 11),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ],
                       ),
-                      const SizedBox(height: 10),
-                      Text(
-                        item.title,
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        item.subtitle,
-                        style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 11),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            },
+                    ),
+                  );
+                },
+              ),
+            ),
           ),
         ),
       ],
@@ -5416,11 +6580,21 @@ class _TrackTileItem extends StatelessWidget {
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
-      subtitle: Text(
-        '${track.artist} • ${_formatDuration(track.duration)}',
-        style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 12),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
+      subtitle: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: ArtistClickableText(
+              artist: track.artist,
+              avatarUrl: track.artworkUrl,
+              style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 12),
+            ),
+          ),
+          Text(
+            ' • ${_formatDuration(track.duration)}',
+            style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 12),
+          ),
+        ],
       ),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
@@ -5905,14 +7079,13 @@ class _LyricsSyncedViewState extends State<_LyricsSyncedView> {
                                                     overflow: TextOverflow.ellipsis,
                                                   ),
                                                   const SizedBox(height: 4),
-                                                  Text(
-                                                    track.artist,
+                                                  ArtistClickableText(
+                                                    artist: track.artist,
+                                                    avatarUrl: track.artworkUrl,
                                                     style: TextStyle(
                                                       fontSize: 15,
                                                       color: SpotifyTheme.lightGray,
                                                     ),
-                                                    maxLines: 1,
-                                                    overflow: TextOverflow.ellipsis,
                                                   ),
                                                 ],
                                               ),
@@ -6517,6 +7690,677 @@ class _ProfileViewState extends State<_ProfileView> {
 }
 
 // ==========================================
+// VISTA DEL PERFIL DEL ARTISTA (DISCOGRAFÍA & TOP POPULARES)
+// ==========================================
+class _ArtistProfileView extends StatefulWidget {
+  const _ArtistProfileView();
+
+  @override
+  State<_ArtistProfileView> createState() => _ArtistProfileViewState();
+}
+
+class _ArtistProfileViewState extends State<_ArtistProfileView> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<LibreSYProvider>(context);
+    final artistName = provider.currentArtistName ?? 'Artista';
+    final avatar = provider.currentArtistAvatar;
+    final tracks = provider.artistTopTracks;
+    final isFollowing = provider.isFollowingArtist(artistName);
+
+    // Identificar álbumes únicos para la sección de Discografía
+    final Map<String, List<Track>> albumGroups = {};
+    for (final t in tracks) {
+      if (t.album.isNotEmpty && t.album != 'Álbum' && t.album != 'Pista Completa Online') {
+        albumGroups.putIfAbsent(t.album, () => []).add(t);
+      }
+    }
+
+    return Container(
+      color: SpotifyTheme.background.withValues(alpha: provider.glassOpacity * 0.45),
+      child: CustomScrollView(
+        controller: _scrollController,
+        slivers: [
+          // Barra Superior de Navegación & Botón Volver
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+              child: Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.arrow_back, color: Colors.white, size: 22),
+                    tooltip: 'Volver a la vista anterior',
+                    onPressed: () => provider.goBackFromArtistProfile(),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Perfil del Artista',
+                    style: TextStyle(
+                      color: SpotifyTheme.lightGray,
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.1,
+                    ),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.refresh, color: Colors.white70, size: 20),
+                    tooltip: 'Recargar discografía',
+                    onPressed: () => provider.fetchArtistDiscography(artistName, preferredArtwork: avatar),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Hero Banner del Artista con Fondo Degradado
+          SliverToBoxAdapter(
+            child: Container(
+              margin: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+              padding: const EdgeInsets.all(28),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    const Color(0xFF1F382B),
+                    const Color(0xFF14201A),
+                    SpotifyTheme.card,
+                  ],
+                ),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+                boxShadow: const [
+                  BoxShadow(color: Colors.black45, blurRadius: 18, offset: Offset(0, 6)),
+                ],
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // Avatar Redondo del Artista en Alta Resolución
+                  Container(
+                    width: 130,
+                    height: 130,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: SpotifyTheme.primary, width: 3),
+                      boxShadow: [
+                        BoxShadow(
+                          color: SpotifyTheme.primary.withValues(alpha: 0.35),
+                          blurRadius: 16,
+                          spreadRadius: 2,
+                        ),
+                      ],
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(70),
+                      child: avatar != null && avatar.isNotEmpty
+                          ? Image.network(
+                              avatar,
+                              fit: BoxFit.cover,
+                              errorBuilder: (context, error, stackTrace) => _fallbackArtistAvatar(artistName),
+                            )
+                          : _fallbackArtistAvatar(artistName),
+                    ),
+                  ),
+                  const SizedBox(width: 28),
+
+                  // Metadatos del Artista
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(Icons.verified, color: Color(0xFF3D91F4), size: 20),
+                            const SizedBox(width: 6),
+                            const Text(
+                              'Artista verificado',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1.1,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          artistName,
+                          style: const TextStyle(
+                            fontSize: 38,
+                            fontWeight: FontWeight.w900,
+                            color: Colors.white,
+                            height: 1.1,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          '${provider.artistMonthlyListenersFormatted} oyentes mensuales',
+                          style: TextStyle(
+                            color: SpotifyTheme.lightGray,
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Fila de Controles de Acción (Reproducir Todo, Aleatorio, Seguir)
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+              child: Row(
+                children: [
+                  // Botón Circular de Reproducir Todo
+                  InkWell(
+                    onTap: () => provider.playArtistAll(),
+                    borderRadius: BorderRadius.circular(30),
+                    child: Container(
+                      width: 54,
+                      height: 54,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [const Color(0xFF00FFA3), SpotifyTheme.primary],
+                        ),
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: SpotifyTheme.primary.withValues(alpha: 0.45),
+                            blurRadius: 14,
+                            offset: const Offset(0, 3),
+                          ),
+                        ],
+                      ),
+                      child: Icon(
+                        (provider.isPlaying &&
+                                provider.currentTrack != null &&
+                                provider.currentTrack!.artist.toLowerCase().contains(artistName.toLowerCase()))
+                            ? Icons.pause
+                            : Icons.play_arrow,
+                        color: Colors.black,
+                        size: 32,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+
+                  // Botón de Reproducción Aleatoria
+                  IconButton(
+                    tooltip: 'Reproducción aleatoria de canciones',
+                    icon: Icon(
+                      Icons.shuffle,
+                      color: provider.isShuffleEnabled ? SpotifyTheme.primary : Colors.white70,
+                      size: 24,
+                    ),
+                    onPressed: () => provider.playArtistAll(shuffle: true),
+                  ),
+                  const SizedBox(width: 12),
+
+                  // Botón de Seguir / Siguiendo
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: isFollowing ? SpotifyTheme.primary : Colors.white,
+                      side: BorderSide(
+                        color: isFollowing ? SpotifyTheme.primary : Colors.white54,
+                        width: 1.4,
+                      ),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                    ),
+                    icon: Icon(isFollowing ? Icons.check : Icons.add, size: 18),
+                    label: Text(
+                      isFollowing ? 'SIGUIENDO' : 'SEGUIR',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, letterSpacing: 1.2),
+                    ),
+                    onPressed: () => provider.toggleFollowArtist(artistName),
+                  ),
+                  const SizedBox(width: 16),
+
+                  // Contador de Canciones
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF222222),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Text(
+                      '${tracks.length} canciones',
+                      style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 12, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Encabezado de la Sección "Populares"
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(26, 18, 26, 10),
+              child: Row(
+                children: [
+                  const Text(
+                    'Populares',
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: Colors.white),
+                  ),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Ordenadas de la más popular a la menos popular',
+                    style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Estado de Carga / Vacío / Lista de Canciones Populares
+          if (provider.isLoadingArtist)
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 48),
+                child: Center(
+                  child: Column(
+                    children: [
+                      CircularProgressIndicator(color: SpotifyTheme.primary),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Cargando canciones populares de $artistName...',
+                        style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 14),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            )
+          else if (tracks.isEmpty)
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 48, horizontal: 24),
+                child: Center(
+                  child: Column(
+                    children: [
+                      const Icon(Icons.music_off, size: 54, color: Colors.white30),
+                      const SizedBox(height: 14),
+                      Text(
+                        'No se encontraron canciones disponibles para "$artistName".',
+                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white70),
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: SpotifyTheme.primary,
+                          foregroundColor: Colors.black,
+                        ),
+                        icon: const Icon(Icons.refresh, size: 18),
+                        label: const Text('Intentar de nuevo'),
+                        onPressed: () => provider.fetchArtistDiscography(artistName, preferredArtwork: avatar),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            )
+          else
+            SliverList(
+              delegate: SliverChildBuilderDelegate(
+                (context, index) {
+                  final track = tracks[index];
+                  final isPlayingThis = provider.currentTrack?.id == track.id;
+                  final rank = index + 1;
+
+                  return _ArtistTrackRankItem(
+                    track: track,
+                    rank: rank,
+                    isSelected: isPlayingThis,
+                    isPlaying: isPlayingThis && provider.isPlaying,
+                  );
+                },
+                childCount: tracks.length,
+              ),
+            ),
+
+          // Sección de Álbumes y Sencillos (Discografía) si existen álbumes detectados
+          if (!provider.isLoadingArtist && albumGroups.isNotEmpty) ...[
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(26, 32, 26, 12),
+                child: Row(
+                  children: [
+                    const Text(
+                      'Discografía & Álbumes',
+                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      '(${albumGroups.length} álbumes y sencillos)',
+                      style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            SliverToBoxAdapter(
+              child: SizedBox(
+                height: 220,
+                child: ListView.separated(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  scrollDirection: Axis.horizontal,
+                  itemCount: albumGroups.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 16),
+                  itemBuilder: (context, index) {
+                    final albumName = albumGroups.keys.elementAt(index);
+                    final albumTracks = albumGroups[albumName]!;
+                    final albumCover = albumTracks.first.artworkUrl;
+
+                    return InkWell(
+                      onTap: () {
+                        provider.playTrack(albumTracks.first);
+                      },
+                      borderRadius: BorderRadius.circular(10),
+                      child: Container(
+                        width: 150,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: SpotifyTheme.card,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: albumCover != null
+                                  ? Image.network(
+                                      albumCover,
+                                      width: 126,
+                                      height: 126,
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (_, __, ___) => _fallbackAlbumArt(),
+                                    )
+                                  : _fallbackAlbumArt(),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              albumName,
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              '${albumTracks.length} ${albumTracks.length == 1 ? "canción" : "canciones"}',
+                              style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 11),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ],
+
+          // Espacio extra al final para que la barra inferior no tape nada
+          const SliverToBoxAdapter(
+            child: SizedBox(height: 120),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _fallbackArtistAvatar(String name) {
+    return Container(
+      color: const Color(0xFF282828),
+      child: Center(
+        child: Text(
+          name.isNotEmpty ? name[0].toUpperCase() : '?',
+          style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: Colors.white70),
+        ),
+      ),
+    );
+  }
+
+  Widget _fallbackAlbumArt() {
+    return Container(
+      width: 126,
+      height: 126,
+      color: SpotifyTheme.darkGray,
+      child: const Icon(Icons.album, color: Colors.white54, size: 48),
+    );
+  }
+}
+
+// Item de canción clasificada por orden de popularidad (#1, #2, ...)
+class _ArtistTrackRankItem extends StatefulWidget {
+  final Track track;
+  final int rank;
+  final bool isSelected;
+  final bool isPlaying;
+
+  const _ArtistTrackRankItem({
+    required this.track,
+    required this.rank,
+    required this.isSelected,
+    required this.isPlaying,
+  });
+
+  @override
+  State<_ArtistTrackRankItem> createState() => _ArtistTrackRankItemState();
+}
+
+class _ArtistTrackRankItemState extends State<_ArtistTrackRankItem> {
+  bool _isHovered = false;
+
+  String _formatDuration(Duration d) {
+    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<LibreSYProvider>(context);
+    final isFav = provider.isFavorite(widget.track);
+    final downloading = provider.isDownloading(widget.track.id);
+
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: InkWell(
+        onTap: () => provider.playTrack(widget.track),
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: _isHovered
+                ? Colors.white.withValues(alpha: 0.08)
+                : widget.isSelected
+                    ? Colors.white.withValues(alpha: 0.04)
+                    : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            children: [
+              // Número de Ranking (#1, #2...) o icono de reproducción
+              SizedBox(
+                width: 32,
+                child: Center(
+                  child: widget.isPlaying
+                      ? Icon(Icons.volume_up, color: SpotifyTheme.primary, size: 18)
+                      : Text(
+                          '#${widget.rank}',
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.bold,
+                            color: widget.isSelected ? SpotifyTheme.primary : Colors.white54,
+                          ),
+                        ),
+                ),
+              ),
+              const SizedBox(width: 8),
+
+              // Portada pequeña de la canción
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: widget.track.artworkUrl != null
+                    ? Image.network(
+                        widget.track.artworkUrl!,
+                        width: 44,
+                        height: 44,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(
+                          width: 44,
+                          height: 44,
+                          color: SpotifyTheme.darkGray,
+                          child: const Icon(Icons.music_note, color: Colors.white54, size: 20),
+                        ),
+                      )
+                    : Container(
+                        width: 44,
+                        height: 44,
+                        color: SpotifyTheme.darkGray,
+                        child: const Icon(Icons.music_note, color: Colors.white54, size: 20),
+                      ),
+              ),
+              const SizedBox(width: 14),
+
+              // Título y Álbum
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.track.title,
+                      style: TextStyle(
+                        color: widget.isSelected ? SpotifyTheme.primary : Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13.5,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      widget.track.album,
+                      style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 11.5),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+
+              // Barra de Popularidad Estilo Spotify
+              SizedBox(
+                width: 60,
+                child: Container(
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white12,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                  alignment: Alignment.centerLeft,
+                  child: FractionallySizedBox(
+                    widthFactor: ((51 - widget.rank.clamp(1, 50)) / 50.0).clamp(0.15, 1.0),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: widget.isSelected ? SpotifyTheme.primary : Colors.white38,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 16),
+
+              // Duración
+              Text(
+                _formatDuration(widget.track.duration),
+                style: TextStyle(color: SpotifyTheme.lightGray, fontSize: 12),
+              ),
+              const SizedBox(width: 12),
+
+              // Botón de Letra Sincronizada
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Ver letra sincronizada',
+                icon: const Icon(Icons.lyrics_outlined, color: Colors.white70, size: 19),
+                onPressed: () {
+                  if (provider.currentTrack?.id != widget.track.id) {
+                    provider.playTrack(widget.track);
+                  }
+                  provider.setTab(4);
+                },
+              ),
+
+              // Botón de Descarga MP3
+              if (!widget.track.isLocal)
+                downloading
+                    ? Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        child: SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: SpotifyTheme.primary),
+                        ),
+                      )
+                    : IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: 'Descargar canción completa en MP3',
+                        icon: const Icon(Icons.download_for_offline_outlined, color: Colors.white70, size: 21),
+                        onPressed: () async {
+                          final savedPath = await provider.downloadTrackAsMp3(widget.track);
+                          if (context.mounted && savedPath != null) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                backgroundColor: SpotifyTheme.primary,
+                                content: Text(
+                                  '¡Descargado en MP3: $savedPath!',
+                                  style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                            );
+                          }
+                        },
+                      ),
+
+              // Botón de Favorito (Corazón Animado)
+              SpotifyAnimatedHeart(
+                isLiked: isFav,
+                size: 21,
+                onTap: () => provider.toggleFavorite(widget.track),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==========================================
 // BARRA INFERIOR DE REPRODUCCIÓN (FULL CONTROLES)
 // ==========================================
 class _BottomPlayerBar extends StatelessWidget {
@@ -6602,15 +8446,24 @@ class _BottomPlayerBar extends StatelessWidget {
                               overflow: TextOverflow.ellipsis,
                             ),
                             const SizedBox(height: 2),
-                            Text(
-                              provider.isBufferingTrack ? 'Descargando pista completa...' : track.artist,
-                              style: TextStyle(
-                                color: provider.isBufferingTrack ? SpotifyTheme.primary : SpotifyTheme.lightGray,
-                                fontSize: 11,
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
+                            provider.isBufferingTrack
+                                ? Text(
+                                    'Descargando pista completa...',
+                                    style: TextStyle(
+                                      color: SpotifyTheme.primary,
+                                      fontSize: 11,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  )
+                                : ArtistClickableText(
+                                    artist: track.artist,
+                                    avatarUrl: track.artworkUrl,
+                                    style: TextStyle(
+                                      color: SpotifyTheme.lightGray,
+                                      fontSize: 11,
+                                    ),
+                                  ),
                           ],
                         ),
                       ),
